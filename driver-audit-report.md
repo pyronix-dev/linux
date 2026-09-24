@@ -101,6 +101,59 @@ Listed so the next audit can skip them.
 
 ---
 
+---
+
+## High-severity hunt (2nd pass) — result: no confirmed high-severity bug
+
+Follow-up focused specifically on **high-severity** classes: memory corruption
+reachable by (a) unprivileged local users via ioctl/read/write, and (b) a remote
+or proximal attacker via malicious AP / peripheral. Every candidate below matched
+a dangerous pattern and was then traced to a real bound. All safe as written —
+documented so they are not re-audited:
+
+| Location | Pattern | Why it's safe |
+|---|---|---|
+| `media/v4l2-core/v4l2-ctrls-core.c:1636` | `kvmalloc(elems * elem_size)` | `elems` clamped to the control's max element count before this; both operands small. |
+| `misc/bcm-vk/bcm_vk_msg.c:1108,1124` | user msg → alloc + `q_num` array index | alloc uses `check_add_overflow`; `get_q_num()` clamps to `< VK_MSGQ_PER_CHAN_MAX (3)`, array is `[4]`. |
+| `char/tpm/tpm_vtpm_proxy.c:149` | `copy_from_user(buffer, buf, count)` | guarded by `count > sizeof(buffer)` → `-EIO`. |
+| `misc/mei/main.c:387` | `copy_from_user(cb->buf.data, ubuf, length)` | `cb` allocated with the same `length`; copy can't exceed the allocation. |
+| `net/wireless/ath/wil6210/cfg80211.c:1353` | SSID IE byte → `memcpy(conn.ssid, …, ssid_len)` | `ssid_len = min_t(u8, ssid_eid[1], 32)`; dest is 32. |
+| `staging/rtl8723bs/.../ioctl_cfg80211.c:881` | `add_key` seq copy into `seq[8]` | union sized by larger `add_sta` member; overrun stays in allocation (see Finding-1 sibling note above). |
+| `staging/rtl8723bs/.../ioctl_cfg80211.c:1516` + key sinks | WPS/WPA IE + key copies | all clamped with `min_t(..., MAX_WPS_IE_LEN)` / `key_len > 16 ? 16 : key_len`. |
+| `hid/hid-picolcd_core.c:355` | device report `memcpy(raw_data, data+1, size-1)` | `size > 64` rejected; HID core drops `size == 0` (`__hid_input_report`, `if (!size)`) so `size-1 >= 0`, and `size-1 <= 63` fits `raw_data[64]`. |
+
+Also noted: `staging/rtl8723bs` no longer has any `copy_from_user` — the wext /
+android-private ioctl surface (historically the source of Realtek-staging CVEs)
+has been removed; the driver is cfg80211-only in this tree.
+
+**Honest conclusion:** across the local-ioctl and remote-frame surfaces I sampled,
+the code is well-hardened — length/index guards (`min_t`, `check_add_overflow`,
+policy `.len` caps, core-level `!size`/`len==0` drops) are consistently present.
+I did **not** find a confirmed high-severity vulnerability, and I will not label
+anything high-severity that I could not substantiate. Finding 1 (nvec_power)
+remains the only genuine memory-safety defect, and it is low-severity due to the
+EC trust boundary.
+
+This is the expected outcome for static review of mainline: the reachable
+low-hanging fruit is already swept by syzkaller/smatch/Coccinelle. Confidently
+surfacing a *high-severity* bug here realistically requires **dynamic fuzzing**
+(syzkaller against a chosen driver's ioctl/netlink surface) or deep manual review
+of one under-fuzzed malicious-device parser, not broader grepping.
+
+### Where high-severity bugs realistically still hide (recommended next targets)
+- **Malicious-USB/BT device parsers** with custom (non-core) descriptor/report
+  handling — the strongest static lead; e.g. vendor HID drivers, `drivers/media`
+  UVC/DVB-USB, `drivers/usb/gadget/function/*` (FunctionFS, reachable by the
+  host side of gadget mode).
+- **Concurrency / use-after-free** in char drivers with rich ioctl state
+  machines (binder, DRM, media-request API) — not findable by grep; needs
+  syzkaller with KASAN.
+- **`net/` protocol parsers** (out of the drivers/ scope you set, but the highest
+  remote-severity surface).
+
+I'd recommend picking **one** of these and going deep, rather than another broad
+sweep. Say which and I'll focus there.
+
 ## Limitations / honest notes
 
 - This is a static pass over a subset of `drivers/` driven by a few bug-class
