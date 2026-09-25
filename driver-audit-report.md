@@ -154,6 +154,88 @@ of one under-fuzzed malicious-device parser, not broader grepping.
 I'd recommend picking **one** of these and going deep, rather than another broad
 sweep. Say which and I'll focus there.
 
+---
+
+## Deep dive — HID malicious-device attack surface (`drivers/hid`)
+
+Went deep on the strongest static lead for *high-severity* bugs: HID `->raw_event`
+handlers, which parse input from a physically-attached (or Bluetooth-paired)
+device. A malicious USB/BT device can send arbitrarily short/malformed reports,
+so any handler that indexes `data[N]` at a fixed offset without checking the
+`size` argument is a candidate OOB.
+
+**Key mitigating fact I confirmed:** for USB HID the receive buffer (`usbhid->inbuf`)
+is floored to `HID_MIN_BUFFER_SIZE = 64` and capped at `HID_MAX_BUFFER_SIZE`
+(`drivers/hid/usbhid/hid-core.c:1095-1106`). So on USB, `data[0..63]` is always
+inside the *allocation* even when the device sends a 1-byte report — a missing
+size check there reads **stale in-buffer bytes**, not out-of-allocation memory.
+That floor does **not** apply to Bluetooth (`hidp`, buffer = skb) or uhid, where
+the same code would be a true OOB — so transport matters for severity.
+
+Also relevant: syzkaller's USB fuzzer (`dummy_hcd` + raw-gadget) *does* fuzz these
+`raw_event` paths with emulated devices, which is why the well-known drivers are
+already hardened (see below). This is the tool suited to the job.
+
+### Finding 2 — hid-pxrc: `raw_event` ignores `size`, accesses `data[7]`/`data[1]`
+
+**File:** `drivers/hid/hid-pxrc.c:53` (`pxrc_raw_event`)
+**Class:** Missing input-length validation → OOB read + logic corruption (CWE-125/CWE-20)
+**Severity:** Low (USB-only; within the 64-byte inbuf → stale-data read, not
+out-of-allocation).
+
+```c
+static int pxrc_raw_event(struct hid_device *hdev, struct hid_report *report,
+                          u8 *data, int size)          /* size never checked */
+{
+        struct pxrc_priv *priv = hid_get_drvdata(hdev);
+        if (priv->alternate) priv->slider = data[7];   /* OOB if report < 8 bytes */
+        else                 priv->dial   = data[7];
+        data[1] = priv->slider;                          /* writes into report buf */
+        data[7] = priv->dial;
+        priv->alternate = !priv->alternate;
+        return 0;
+}
+```
+A malicious device matching the PhoenixRC VID/PID (`1781:0898`) that sends a report
+shorter than 8 bytes makes the driver read/write `data[7]`. Because pxrc binds
+`HID_USB_DEVICE` only, both stay inside the ≥64-byte `inbuf`, so this is a
+robustness/stale-data bug, not corruption. Still a legitimate hardening fix:
+```c
+        if (size < 8)
+                return 0;
+```
+(Would be a genuine OOB if this driver ever bound a non-USB transport.)
+
+### Systemic pattern (latent, USB-floor-protected)
+A scan (`scratchpad/scan.py`) found ~12 `raw_event` handlers that never reference
+their `size` argument and index `data[]` at fixed offsets, trusting the report
+length: `hid-pxrc` (`data[7]`), `hid-cp2112` (`data[3]`), `hid-zydacron`
+(`data[1]`), `hid-mcp2200`, and the roccat family (`konepure/koneplus/kovaplus/
+pyra/isku/ryos/savu`, which `roccat_report_event()` a fixed-size report to a
+chardev — a bounded stale-`inbuf` info-exposure). All are USB-only, so all are
+shielded by the 64-byte floor today; none is out-of-allocation. Worth a
+defensive `if (size < N) return` sweep upstream, but not high-severity.
+
+### Verified hardened (checked, no bug)
+- `hid-magicmouse.c` — per-report-ID `size` checks, `npoints > 15` caps, and an
+  explicit `nested` recursion guard against `DOUBLE_REPORT_ID` stack-overflow
+  (a fixed CVE). Solid.
+- `hid-sensor-hub.c` — `copy_size = clamp(sz, 0, avail)` before
+  `memcpy(pending.raw_data + index, …)`; reads stay within the inbuf. The
+  historical pending-index overflow is fixed.
+- `hid-logitech-dj.c` — `device_index` validated to `[1,7]` (`:1664`, `:1737`)
+  before every `paired_dj_devices[8]` access; the Unifying pairing-answer path
+  re-derives and re-validates the index and checks `size` first.
+
+**Deep-dive conclusion:** the HID malicious-device surface is well-hardened
+(size checks, index validation, recursion guards, explicit anti-malicious-device
+comments), consistent with it being actively USB-fuzzed. I found one real
+low-severity robustness bug (pxrc) and a latent class shielded by the USB buffer
+floor — **no high-severity vulnerability**. The realistic path to a high-severity
+HID/USB bug is running the **syzkaller USB fuzzer** (or `raw-gadget` harness)
+against Bluetooth/i2c-hid transports, which lack the 64-byte floor — not more
+static review.
+
 ## Limitations / honest notes
 
 - This is a static pass over a subset of `drivers/` driven by a few bug-class
